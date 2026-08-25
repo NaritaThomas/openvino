@@ -13,6 +13,7 @@
 #include "openvino/op/util/op_types.hpp"
 #include "ops_bridge.hpp"
 #include "place.hpp"
+#include "utils/attention.hpp"
 
 using namespace ov::frontend::onnx;
 
@@ -404,4 +405,9 @@ void TranslateSession::translate_graph(const ov::frontend::InputModel::Ptr& inpu
     for (const auto& pair : metadata) {
         ov_model->set_rt_info(pair.second, framework_section, pair.first);
     }
+    // Some models express their sliding-window layout as model-level framework metadata (per-layer
+    // full_attention_layers / sliding_window_layers + a single sliding_window_size) rather than as a
+    // local_window_size attribute on each ONNX GroupQueryAttention node. Apply that override now that the
+    // metadata and all GroupQueryAttention nodes exist.
+    ov::frontend::onnx::attention::apply_gqa_local_window_size_from_metadata(ov_model, metadata);
 }

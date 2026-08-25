@@ -4,7 +4,10 @@
 
 #include "utils/attention.hpp"
 
+#include <cctype>
 #include <limits>
+#include <set>
+#include <sstream>
 
 #include "openvino/op/add.hpp"
 #include "openvino/op/concat.hpp"
@@ -14,6 +17,7 @@
 #include "openvino/op/divide.hpp"
 #include "openvino/op/gather.hpp"
 #include "openvino/op/greater_eq.hpp"
+#include "openvino/op/group_query_attention.hpp"
 #include "openvino/op/is_nan.hpp"
 #include "openvino/op/less_eq.hpp"
 #include "openvino/op/matmul.hpp"
@@ -205,6 +209,82 @@ ov::OutputVector build_manual_attention(const ov::Output<ov::Node>& Q,
     auto output = std::make_shared<v0::MatMul>(softmax_out, V);
 
     return {output, qk_debug_output};
+}
+
+namespace {
+// Parses a Python-style bracketed integer list, e.g. "[2, 4, 9, 10]", into a set of int64_t. Returns an
+// empty set for an empty or malformed input (no partial results are trusted).
+std::set<int64_t> parse_layer_index_list(const std::string& value) {
+    std::set<int64_t> result;
+    std::string trimmed;
+    trimmed.reserve(value.size());
+    for (const char c : value) {
+        if (c != '[' && c != ']' && !std::isspace(static_cast<unsigned char>(c))) {
+            trimmed.push_back(c);
+        }
+    }
+    if (trimmed.empty()) {
+        return result;
+    }
+    std::stringstream ss(trimmed);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        if (item.empty()) {
+            continue;
+        }
+        try {
+            result.insert(static_cast<int64_t>(std::stoll(item)));
+        } catch (const std::exception&) {
+            // Malformed entry: ignore this override rather than risk misclassifying layers.
+            return {};
+        }
+    }
+    return result;
+}
+}  // namespace
+
+void apply_gqa_local_window_size_from_metadata(const std::shared_ptr<ov::Model>& model,
+                                               const std::map<std::string, std::string>& framework_metadata) {
+    const auto full_it = framework_metadata.find("full_attention_layers");
+    const auto sliding_it = framework_metadata.find("sliding_window_layers");
+    const auto window_it = framework_metadata.find("sliding_window_size");
+    // Nothing to do unless both the sliding-window layer list and its window size are present: a
+    // full_attention_layers-only model matches the default (window disabled) local_window_size already.
+    if (sliding_it == framework_metadata.end() || window_it == framework_metadata.end()) {
+        return;
+    }
+
+    const auto sliding_window_layers = parse_layer_index_list(sliding_it->second);
+    if (sliding_window_layers.empty()) {
+        return;
+    }
+    const auto full_attention_layers =
+        full_it != framework_metadata.end() ? parse_layer_index_list(full_it->second) : std::set<int64_t>{};
+
+    int64_t sliding_window_size = 0;
+    try {
+        sliding_window_size = static_cast<int64_t>(std::stoll(window_it->second));
+    } catch (const std::exception&) {
+        return;
+    }
+    if (sliding_window_size < 1) {
+        return;
+    }
+
+    // The Nth GroupQueryAttention node encountered in topological order is treated as transformer layer N.
+    int64_t layer_index = 0;
+    for (const auto& op : model->get_ordered_ops()) {
+        const auto gqa = ov::as_type_ptr<ov::op::internal::GroupQueryAttention>(op);
+        if (!gqa) {
+            continue;
+        }
+        if (full_attention_layers.count(layer_index) != 0) {
+            gqa->set_local_window_size(-1);
+        } else if (sliding_window_layers.count(layer_index) != 0) {
+            gqa->set_local_window_size(sliding_window_size);
+        }
+        ++layer_index;
+    }
 }
 
 }  // namespace attention

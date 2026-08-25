@@ -4,9 +4,12 @@
 #pragma once
 
 #include <limits>
+#include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
+#include "openvino/core/model.hpp"
 #include "openvino/core/node.hpp"
 #include "openvino/op/shape_of.hpp"
 
@@ -101,6 +104,22 @@ ov::OutputVector build_manual_attention(const ov::Output<ov::Node>& Q,
                                         float softcap,
                                         int64_t qk_matmul_output_mode,
                                         bool include_safe_softmax = true);
+
+/// \brief Overrides local_window_size on internal::GroupQueryAttention nodes using per-layer framework
+/// rt_info metadata, for models whose sliding-window layout is expressed at the model level (e.g.
+/// "full_attention_layers" / "sliding_window_layers" / "sliding_window_size" framework metadata) rather
+/// than as a per-node ONNX attribute.
+///
+/// GroupQueryAttention nodes are matched to transformer layer indices by their order of appearance in
+/// the model's topological order: the Nth GroupQueryAttention node encountered is treated as layer N.
+/// A layer listed in "full_attention_layers" gets local_window_size = -1 (window disabled); a layer
+/// listed in "sliding_window_layers" gets local_window_size = the "sliding_window_size" value. Layers
+/// in neither list, and models missing the required metadata keys, are left unchanged.
+///
+/// \param model              The converted ONNX model.
+/// \param framework_metadata The model's "framework" rt_info map (ONNX metadata_props).
+void apply_gqa_local_window_size_from_metadata(const std::shared_ptr<ov::Model>& model,
+                                               const std::map<std::string, std::string>& framework_metadata);
 
 }  // namespace attention
 }  // namespace onnx

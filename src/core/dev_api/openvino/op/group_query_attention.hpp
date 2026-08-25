@@ -109,6 +109,11 @@ public:
     int64_t get_local_window_size() const {
         return m_local_window_size;
     }
+    // Overrides local_window_size after construction, e.g. when a per-layer value derived from
+    // framework rt_info metadata (not encoded in the ONNX node's own attribute) must be applied.
+    void set_local_window_size(int64_t local_window_size) {
+        m_local_window_size = local_window_size;
+    }
     // When true, the past/present KV buffers are window-sized (capacity C) and rolled with front
     // eviction, keeping only the most recent min(total, C) tokens in cache-relative coordinates.
     bool get_sliding_window_cache() const {
