@@ -332,7 +332,7 @@ protected:
         // here. A MatcherPass is a no-op where the operator is absent, so this is safe to always register; delete it
         // once the loaded compiler is known to be caught up.
 
-        manager.register_pass<ov::pass::GroupQueryAttentionDecomposition>();
+        // manager.register_pass<ov::pass::GroupQueryAttentionDecomposition>();
 
         manager.run_passes(model);
 
