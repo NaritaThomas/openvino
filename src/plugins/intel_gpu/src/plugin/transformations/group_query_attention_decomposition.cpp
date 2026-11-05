@@ -10,6 +10,7 @@
 
 #include "intel_gpu/op/sdpa.hpp"
 #include "intel_gpu/op/stateless_kv.hpp"
+#include "openvino/op/add.hpp"
 #include "openvino/op/broadcast.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/group_query_attention.hpp"
@@ -138,6 +139,8 @@ GroupQueryAttentionDecomposition::KVCacheOutputs GroupQueryAttentionDecompositio
     
     auto& metadata = static_cast<StatelessKVMetadata&>(metadata_);
 
+    const bool query_seqlens = node->has_padded_query();
+
     const bool need_qk_output = node->get_qk_output() != ov::op::internal::GroupQueryAttentionQKOutput::NONE;
     const bool use_explicit_attention = node->get_softcap() > 0.0f || need_qk_output;
     bool can_fuse_transpose_v = m_sdpa_support_immad && !use_explicit_attention;
@@ -154,10 +157,14 @@ GroupQueryAttentionDecomposition::KVCacheOutputs GroupQueryAttentionDecompositio
     }
 
     KVCacheOutputs outputs;
+    // StatelessKV takes the present length and writes the S new rows at present - S. A right-padded chunk writes them
+    // at its past P = total - Q, so it passes P + S; SDPA's lower-right causal mask then lets row s see keys <= P + s.
+    const ov::Output<ov::Node> present_len =
+        query_seqlens ? register_new_node<v1::Add>(past_seqlen, current_seqlen_scalar)->output(0) : seqlens_1d;
 
     if (!node->get_sliding_window_cache()) {
 
-        const auto key_cache = register_new_node<op::StatelessKV>(past_key, key, seqlens_1d, 2, true);
+        const auto key_cache = register_new_node<op::StatelessKV>(past_key, key, present_len, 2, true);
 
         const auto value_transpose_order = register_new_node(v0::Constant::create(ov::element::i64, ov::Shape{4}, transpose_v_order));
         const auto find_value_transpose = [](const ov::Output<ov::Node>& output) -> std::shared_ptr<v1::Transpose> {
@@ -190,10 +197,10 @@ GroupQueryAttentionDecomposition::KVCacheOutputs GroupQueryAttentionDecompositio
             // After:  past_value -------------------------> StatelessKV(axis=3) -> present_value.
             //         current_value -> Transpose ----------^      (the output Transpose is bypassed)
             const auto transposed_value = register_new_node<v1::Transpose>(value, value_transpose_order);
-            value_cache = register_new_node<op::StatelessKV>(past_value_transpose->input_value(0), transposed_value, seqlens_1d, 3, true);
+            value_cache = register_new_node<op::StatelessKV>(past_value_transpose->input_value(0), transposed_value, present_len, 3, true);
             present_value_transpose->output(0).replace(value_cache->output(0));
         } else {
-            value_cache = register_new_node<op::StatelessKV>(past_value, value, seqlens_1d, 2, true);
+            value_cache = register_new_node<op::StatelessKV>(past_value, value, present_len, 2, true);
         }
 
         outputs.present_key = key_cache->output(0);

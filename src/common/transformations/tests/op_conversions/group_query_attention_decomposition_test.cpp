@@ -39,6 +39,7 @@
 #include "openvino/op/tanh.hpp"
 #include "openvino/op/variadic_split.hpp"
 #include "openvino/pass/manager.hpp"
+#include "openvino/runtime/tensor.hpp"
 #include "ov_ops/rms.hpp"
 #include "transformations/common_optimizations/rms_fusion.hpp"
 
@@ -820,6 +821,305 @@ TEST(GroupQueryAttentionValues, batched_cache_update_is_per_batch) {
         for (const auto& past : {Dimension(8), Dimension::dynamic()}) {
             EXPECT_EQ(count_decomposed_ops(batch, past, is_flat_scatter_update), 2u) << batch << " " << past;
             EXPECT_EQ(count_decomposed_ops(batch, past, is_axis_scatter_update), 0u) << batch << " " << past;
+        }
+    }
+}
+
+// ORT sizes a growing cache's public present to max(past_rows, total_sequence_length) (CheckInputs in
+// onnxruntime/contrib_ops/cpu/bert/group_query_attention_helper.h), not to the write window a padded chunk
+// actually touches. A sliced present output would hide an undersized buffer, so this evaluates the raw
+// (unsliced) decomposed graph with the exact P=3/S=4/Q=2/past_rows=5/total_sequence_length=10 scenario where the
+// two differ (write end = 3 + 4 = 7, but ORT's declared capacity is max(5, 10) = 10), and checks both the
+// resulting shape and that the unwritten past prefix survives untouched.
+TEST(GroupQueryAttentionValues, padded_query_growing_cache_present_keeps_total_sequence_length_capacity) {
+    const auto f32 = element::f32;
+    constexpr int64_t S = 4;
+    constexpr int64_t past_rows = 5;
+    constexpr int64_t total_sequence_length = 10;
+    constexpr int64_t kept_past = 3;  // P = max(total - Q, 0) = max((seqlens_k + 1) - query_seqlens, 0) = max(5-2,0)
+
+    auto q = std::make_shared<op::v0::Parameter>(f32, PartialShape{Dimension::dynamic(), NUM_HEADS, S, HEAD_SIZE});
+    auto k = std::make_shared<op::v0::Parameter>(f32, PartialShape{Dimension::dynamic(), KV_NUM_HEADS, S, HEAD_SIZE});
+    auto v = std::make_shared<op::v0::Parameter>(f32, PartialShape{Dimension::dynamic(), KV_NUM_HEADS, S, HEAD_SIZE});
+    auto past_key = std::make_shared<op::v0::Parameter>(
+        f32,
+        PartialShape{Dimension::dynamic(), KV_NUM_HEADS, Dimension::dynamic(), HEAD_SIZE});
+    auto past_value = std::make_shared<op::v0::Parameter>(
+        f32,
+        PartialShape{Dimension::dynamic(), KV_NUM_HEADS, Dimension::dynamic(), HEAD_SIZE});
+    auto seqlens_k = std::make_shared<op::v0::Parameter>(element::i32, PartialShape{Dimension::dynamic()});
+    auto total_seq = op::v0::Constant::create(element::i32, Shape{}, {total_sequence_length});
+    const auto empty = op::v0::Constant::create(element::dynamic, Shape{0}, {});
+    OutputVector args{q, k, v, past_key, past_value, seqlens_k, total_seq};
+    args.resize(16, empty);
+    auto query_seqlens = std::make_shared<op::v0::Parameter>(element::i32, PartialShape{Dimension::dynamic()});
+    args.push_back(query_seqlens);
+
+    auto gqa = std::make_shared<GroupQueryAttention>(args,
+                                                     NUM_HEADS,
+                                                     KV_NUM_HEADS,
+                                                     /*scale*/ 0.0f,
+                                                     /*do_rotary*/ false,
+                                                     /*rotary_interleaved*/ false);
+    ASSERT_TRUE(gqa->has_padded_query());
+    ASSERT_FALSE(gqa->has_fixed_kv_capacity());
+
+    // Only present_key/present_value are checked, so only they are declared as Results: they don't depend on the
+    // attention output, and Model::evaluate only evaluates a Result's ancestors.
+    ResultVector results{std::make_shared<op::v0::Result>(gqa->output(1)),
+                         std::make_shared<op::v0::Result>(gqa->output(2))};
+    ParameterVector params{q, k, v, past_key, past_value, seqlens_k, query_seqlens};
+    auto model = std::make_shared<Model>(results, params);
+    decompose(model);
+
+    const auto batch = Shape{1};
+    const auto q_shape = Shape{1, static_cast<size_t>(NUM_HEADS), S, HEAD_SIZE};
+    const auto kv_shape = Shape{1, static_cast<size_t>(KV_NUM_HEADS), S, HEAD_SIZE};
+    const auto past_shape = Shape{1, static_cast<size_t>(KV_NUM_HEADS), past_rows, HEAD_SIZE};
+
+    std::vector<float> q_data(shape_size(q_shape), 0.5f);
+    std::vector<float> new_k_data(shape_size(kv_shape));
+    std::vector<float> new_v_data(shape_size(kv_shape));
+    for (int64_t row = 0; row < S; ++row)
+        for (int64_t col = 0; col < HEAD_SIZE; ++col) {
+            new_k_data[row * HEAD_SIZE + col] = 100.0f + static_cast<float>(row);
+            new_v_data[row * HEAD_SIZE + col] = 200.0f + static_cast<float>(row);
+        }
+    std::vector<float> past_k_data(shape_size(past_shape));
+    std::vector<float> past_v_data(shape_size(past_shape));
+    for (int64_t row = 0; row < past_rows; ++row)
+        for (int64_t col = 0; col < HEAD_SIZE; ++col) {
+            past_k_data[row * HEAD_SIZE + col] = static_cast<float>(row);
+            past_v_data[row * HEAD_SIZE + col] = static_cast<float>(row);
+        }
+    std::vector<int32_t> seqlens_k_data{4};
+    std::vector<int32_t> query_seqlens_data{2};
+
+    ov::TensorVector inputs{ov::Tensor(f32, q_shape, q_data.data()),
+                            ov::Tensor(f32, kv_shape, new_k_data.data()),
+                            ov::Tensor(f32, kv_shape, new_v_data.data()),
+                            ov::Tensor(f32, past_shape, past_k_data.data()),
+                            ov::Tensor(f32, past_shape, past_v_data.data()),
+                            ov::Tensor(element::i32, batch, seqlens_k_data.data()),
+                            ov::Tensor(element::i32, batch, query_seqlens_data.data())};
+    ov::TensorVector outputs(model->get_output_size());
+    ASSERT_TRUE(model->evaluate(outputs, inputs));
+
+    const auto expected_present_shape = Shape{1, static_cast<size_t>(KV_NUM_HEADS), total_sequence_length, HEAD_SIZE};
+    EXPECT_EQ(outputs[0].get_shape(), expected_present_shape)
+        << "unsliced present_key must follow total_sequence_length";
+    EXPECT_EQ(outputs[1].get_shape(), expected_present_shape)
+        << "unsliced present_value must follow total_sequence_length";
+
+    const auto* present_key = outputs[0].data<float>();
+    const auto* present_value = outputs[1].data<float>();
+    // Rows before the write window (the unwritten past prefix) must survive untouched.
+    for (int64_t row = 0; row < kept_past; ++row) {
+        EXPECT_FLOAT_EQ(present_key[row * HEAD_SIZE], static_cast<float>(row))
+            << "past prefix row " << row << " clobbered";
+        EXPECT_FLOAT_EQ(present_value[row * HEAD_SIZE], static_cast<float>(row))
+            << "past prefix row " << row << " clobbered";
+    }
+    // [kept_past, kept_past + S) must hold the new chunk, overwriting any stale past rows in the overlap.
+    for (int64_t row = 0; row < S; ++row) {
+        EXPECT_FLOAT_EQ(present_key[(kept_past + row) * HEAD_SIZE], 100.0f + static_cast<float>(row))
+            << "new chunk row " << row << " not written at kept_past + row";
+        EXPECT_FLOAT_EQ(present_value[(kept_past + row) * HEAD_SIZE], 200.0f + static_cast<float>(row))
+            << "new chunk row " << row << " not written at kept_past + row";
+    }
+}
+
+// Same scenario as above but with a statically-known batch of 1 for Q/K/V/past, which routes through the scalar
+// construct_kvcache (ScatterUpdate/Slice+Concat) path instead of construct_batched_kvcache's flat per-batch
+// ScatterUpdate -- a separate resize_kv_to_capacity call site the dynamic-batch test above never exercises.
+TEST(GroupQueryAttentionValues, padded_query_growing_cache_present_keeps_total_sequence_length_capacity_static_batch) {
+    const auto f32 = element::f32;
+    constexpr int64_t S = 4;
+    constexpr int64_t past_rows = 5;
+    constexpr int64_t total_sequence_length = 10;
+    constexpr int64_t kept_past = 3;  // P = max(total - Q, 0) = max((seqlens_k + 1) - query_seqlens, 0) = max(5-2,0)
+
+    auto q = std::make_shared<op::v0::Parameter>(f32, PartialShape{1, NUM_HEADS, S, HEAD_SIZE});
+    auto k = std::make_shared<op::v0::Parameter>(f32, PartialShape{1, KV_NUM_HEADS, S, HEAD_SIZE});
+    auto v = std::make_shared<op::v0::Parameter>(f32, PartialShape{1, KV_NUM_HEADS, S, HEAD_SIZE});
+    auto past_key =
+        std::make_shared<op::v0::Parameter>(f32, PartialShape{1, KV_NUM_HEADS, Dimension::dynamic(), HEAD_SIZE});
+    auto past_value =
+        std::make_shared<op::v0::Parameter>(f32, PartialShape{1, KV_NUM_HEADS, Dimension::dynamic(), HEAD_SIZE});
+    auto seqlens_k = std::make_shared<op::v0::Parameter>(element::i32, PartialShape{1});
+    auto total_seq = op::v0::Constant::create(element::i32, Shape{}, {total_sequence_length});
+    const auto empty = op::v0::Constant::create(element::dynamic, Shape{0}, {});
+    OutputVector args{q, k, v, past_key, past_value, seqlens_k, total_seq};
+    args.resize(16, empty);
+    auto query_seqlens = std::make_shared<op::v0::Parameter>(element::i32, PartialShape{1});
+    args.push_back(query_seqlens);
+
+    auto gqa = std::make_shared<GroupQueryAttention>(args,
+                                                     NUM_HEADS,
+                                                     KV_NUM_HEADS,
+                                                     /*scale*/ 0.0f,
+                                                     /*do_rotary*/ false,
+                                                     /*rotary_interleaved*/ false);
+    ASSERT_TRUE(gqa->has_padded_query());
+    ASSERT_FALSE(gqa->has_fixed_kv_capacity());
+
+    ResultVector results{std::make_shared<op::v0::Result>(gqa->output(1)),
+                         std::make_shared<op::v0::Result>(gqa->output(2))};
+    ParameterVector params{q, k, v, past_key, past_value, seqlens_k, query_seqlens};
+    auto model = std::make_shared<Model>(results, params);
+    decompose(model);
+
+    // A static batch of 1 must take the scalar cache-update path (no per-batch flat ScatterUpdate).
+    size_t flat_scatter_count = 0;
+    for (const auto& op : model->get_ordered_ops())
+        flat_scatter_count += is_flat_scatter_update(op) ? 1 : 0;
+    EXPECT_EQ(flat_scatter_count, 0u);
+
+    const auto batch = Shape{1};
+    const auto q_shape = Shape{1, static_cast<size_t>(NUM_HEADS), S, HEAD_SIZE};
+    const auto kv_shape = Shape{1, static_cast<size_t>(KV_NUM_HEADS), S, HEAD_SIZE};
+    const auto past_shape = Shape{1, static_cast<size_t>(KV_NUM_HEADS), past_rows, HEAD_SIZE};
+
+    std::vector<float> q_data(shape_size(q_shape), 0.5f);
+    std::vector<float> new_k_data(shape_size(kv_shape));
+    std::vector<float> new_v_data(shape_size(kv_shape));
+    for (int64_t row = 0; row < S; ++row)
+        for (int64_t col = 0; col < HEAD_SIZE; ++col) {
+            new_k_data[row * HEAD_SIZE + col] = 100.0f + static_cast<float>(row);
+            new_v_data[row * HEAD_SIZE + col] = 200.0f + static_cast<float>(row);
+        }
+    std::vector<float> past_k_data(shape_size(past_shape));
+    std::vector<float> past_v_data(shape_size(past_shape));
+    for (int64_t row = 0; row < past_rows; ++row)
+        for (int64_t col = 0; col < HEAD_SIZE; ++col) {
+            past_k_data[row * HEAD_SIZE + col] = static_cast<float>(row);
+            past_v_data[row * HEAD_SIZE + col] = static_cast<float>(row);
+        }
+    std::vector<int32_t> seqlens_k_data{4};
+    std::vector<int32_t> query_seqlens_data{2};
+
+    ov::TensorVector inputs{ov::Tensor(f32, q_shape, q_data.data()),
+                            ov::Tensor(f32, kv_shape, new_k_data.data()),
+                            ov::Tensor(f32, kv_shape, new_v_data.data()),
+                            ov::Tensor(f32, past_shape, past_k_data.data()),
+                            ov::Tensor(f32, past_shape, past_v_data.data()),
+                            ov::Tensor(element::i32, batch, seqlens_k_data.data()),
+                            ov::Tensor(element::i32, batch, query_seqlens_data.data())};
+    ov::TensorVector outputs(model->get_output_size());
+    ASSERT_TRUE(model->evaluate(outputs, inputs));
+
+    const auto expected_present_shape = Shape{1, static_cast<size_t>(KV_NUM_HEADS), total_sequence_length, HEAD_SIZE};
+    EXPECT_EQ(outputs[0].get_shape(), expected_present_shape)
+        << "unsliced present_key must follow total_sequence_length";
+    EXPECT_EQ(outputs[1].get_shape(), expected_present_shape)
+        << "unsliced present_value must follow total_sequence_length";
+
+    const auto* present_key = outputs[0].data<float>();
+    const auto* present_value = outputs[1].data<float>();
+    for (int64_t row = 0; row < kept_past; ++row) {
+        EXPECT_FLOAT_EQ(present_key[row * HEAD_SIZE], static_cast<float>(row))
+            << "past prefix row " << row << " clobbered";
+        EXPECT_FLOAT_EQ(present_value[row * HEAD_SIZE], static_cast<float>(row))
+            << "past prefix row " << row << " clobbered";
+    }
+    for (int64_t row = 0; row < S; ++row) {
+        EXPECT_FLOAT_EQ(present_key[(kept_past + row) * HEAD_SIZE], 100.0f + static_cast<float>(row))
+            << "new chunk row " << row << " not written at kept_past + row";
+        EXPECT_FLOAT_EQ(present_value[(kept_past + row) * HEAD_SIZE], 200.0f + static_cast<float>(row))
+            << "new chunk row " << row << " not written at kept_past + row";
+    }
+}
+
+// qk_output is laid out over total_sequence_length too: a padded chunk's total_sequence_length can exceed the
+// tight attention buffer the same way it can exceed the present cache, so the shared QK scores need the same
+// zero-padded tail instead of Slice silently returning fewer columns than declared.
+TEST(GroupQueryAttentionValues, padded_query_qk_output_keeps_total_sequence_length_capacity) {
+    for (const auto mode : {op::internal::GroupQueryAttentionQKOutput::BEFORE_SOFTMAX,
+                            op::internal::GroupQueryAttentionQKOutput::AFTER_SOFTMAX}) {
+        const auto f32 = element::f32;
+        constexpr int64_t S = 4;
+        constexpr int64_t past_rows = 5;
+        constexpr int64_t total_sequence_length = 10;
+        constexpr int64_t attention_cols = 7;  // kept_past(3) + S(4): the tight attention buffer this step writes
+
+        auto q = std::make_shared<op::v0::Parameter>(f32, PartialShape{Dimension::dynamic(), NUM_HEADS, S, HEAD_SIZE});
+        auto k =
+            std::make_shared<op::v0::Parameter>(f32, PartialShape{Dimension::dynamic(), KV_NUM_HEADS, S, HEAD_SIZE});
+        auto v =
+            std::make_shared<op::v0::Parameter>(f32, PartialShape{Dimension::dynamic(), KV_NUM_HEADS, S, HEAD_SIZE});
+        auto past_key = std::make_shared<op::v0::Parameter>(
+            f32,
+            PartialShape{Dimension::dynamic(), KV_NUM_HEADS, Dimension::dynamic(), HEAD_SIZE});
+        auto past_value = std::make_shared<op::v0::Parameter>(
+            f32,
+            PartialShape{Dimension::dynamic(), KV_NUM_HEADS, Dimension::dynamic(), HEAD_SIZE});
+        auto seqlens_k = std::make_shared<op::v0::Parameter>(element::i32, PartialShape{Dimension::dynamic()});
+        auto total_seq = std::make_shared<op::v0::Parameter>(element::i32, PartialShape{});
+        const auto empty = op::v0::Constant::create(element::dynamic, Shape{0}, {});
+        OutputVector args{q, k, v, past_key, past_value, seqlens_k, total_seq};
+        args.resize(16, empty);
+        auto query_seqlens = std::make_shared<op::v0::Parameter>(element::i32, PartialShape{1});
+        args.push_back(query_seqlens);
+
+        auto gqa = std::make_shared<GroupQueryAttention>(args,
+                                                         NUM_HEADS,
+                                                         KV_NUM_HEADS,
+                                                         /*scale*/ 0.0f,
+                                                         /*do_rotary*/ false,
+                                                         /*rotary_interleaved*/ false,
+                                                         /*kv_cache_bit_width*/ 0,
+                                                         op::internal::GroupQueryAttentionQuantType::NONE,
+                                                         op::internal::GroupQueryAttentionQuantType::NONE,
+                                                         /*local_window_size*/ -1,
+                                                         /*sliding_window_cache*/ false,
+                                                         /*smooth_softmax*/ false,
+                                                         /*causal*/ true,
+                                                         /*softcap*/ 0.0f,
+                                                         /*qk_norm_epsilon*/ 1e-6f,
+                                                         mode);
+        ASSERT_TRUE(gqa->has_padded_query());
+
+        // Only the QK scores output is checked, so only it is declared as a Result.
+        ResultVector results{std::make_shared<op::v0::Result>(gqa->output(3))};
+        ParameterVector params{q, k, v, past_key, past_value, seqlens_k, total_seq, query_seqlens};
+        auto model = std::make_shared<Model>(results, params);
+        decompose(model);
+
+        const auto q_shape = Shape{1, static_cast<size_t>(NUM_HEADS), S, HEAD_SIZE};
+        const auto kv_shape = Shape{1, static_cast<size_t>(KV_NUM_HEADS), S, HEAD_SIZE};
+        const auto past_shape = Shape{1, static_cast<size_t>(KV_NUM_HEADS), past_rows, HEAD_SIZE};
+        std::vector<float> q_data(shape_size(q_shape), 0.1f);
+        std::vector<float> k_data(shape_size(kv_shape), 0.1f);
+        std::vector<float> v_data(shape_size(kv_shape), 0.1f);
+        std::vector<float> past_k_data(shape_size(past_shape), 0.1f);
+        std::vector<float> past_v_data(shape_size(past_shape), 0.1f);
+        std::vector<int32_t> seqlens_k_data{4};
+        std::vector<int32_t> total_seq_data{total_sequence_length};
+        std::vector<int32_t> query_seqlens_data{2};
+
+        ov::TensorVector inputs{ov::Tensor(f32, q_shape, q_data.data()),
+                                ov::Tensor(f32, kv_shape, k_data.data()),
+                                ov::Tensor(f32, kv_shape, v_data.data()),
+                                ov::Tensor(f32, past_shape, past_k_data.data()),
+                                ov::Tensor(f32, past_shape, past_v_data.data()),
+                                ov::Tensor(element::i32, Shape{1}, seqlens_k_data.data()),
+                                ov::Tensor(element::i32, Shape{}, total_seq_data.data()),
+                                ov::Tensor(element::i32, Shape{1}, query_seqlens_data.data())};
+        ov::TensorVector outputs(1);
+        ASSERT_TRUE(model->evaluate(outputs, inputs));
+
+        const auto expected_shape = Shape{1, static_cast<size_t>(NUM_HEADS), S, total_sequence_length};
+        EXPECT_EQ(outputs[0].get_shape(), expected_shape) << "qk_output must follow total_sequence_length";
+
+        const auto* scores = outputs[0].data<float>();
+        for (int64_t head = 0; head < NUM_HEADS; ++head) {
+            for (int64_t row = 0; row < S; ++row) {
+                for (int64_t col = attention_cols; col < total_sequence_length; ++col) {
+                    const auto idx = ((head * S + row) * total_sequence_length) + col;
+                    EXPECT_FLOAT_EQ(scores[idx], 0.0f)
+                        << "qk_output column " << col << " beyond the attention buffer must be zero-padded";
+                }
+            }
         }
     }
 }

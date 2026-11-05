@@ -179,6 +179,15 @@ ov::OutputVector ov::pass::GroupQueryAttentionDecomposition::decompose(
     const auto kv_seqlen = independent_kv_len ? get_dimensions(register_new_node<v3::ShapeOf>(K), {2}) : nullptr;
     const auto seqlens_elemi64 = register_new_node<v0::Convert>(seqlens_k, ov::element::i64);
     const auto real_seqlens = register_new_node<v1::Add>(seqlens_elemi64, one);
+    // Right-padded chunk (query_seqlens): only the first Q of the S query rows are real tokens, so the past is
+    // total - Q. All S rows are still written at [past, past + S) to keep shapes static; the padded tail lands at or
+    // beyond total, where no query reads it and the next step overwrites it (ORT requires past + S <= capacity).
+    // Like seqlens_k, Q is taken as given (ORT: 1 <= Q <= min(S, total)); a statically single-token step skips it.
+    const bool has_query_seqlens = node->has_padded_query();
+    const auto query_seqlens_i64 =
+        has_query_seqlens
+            ? register_new_node<v0::Convert>(get_input(GQAInputs::QUERY_SEQLENS), ov::element::i64)->output(0)
+            : ov::Output<ov::Node>();
 
     // Per-batch lengths (ORT: one seqlens_k entry per batch) whenever the batch is not statically 1. A static batch
     // of 1 keeps the scalar-length graph below unchanged, since plugins and the NPU compiler pattern-match it; the
@@ -188,7 +197,7 @@ ov::OutputVector ov::pass::GroupQueryAttentionDecomposition::decompose(
                          !(q_ps.rank().is_static() && q_ps[0].is_static() && q_ps[0].get_length() == 1);
     // [B, 1, 1]: total = seqlens_k + 1, the causal offset of the first query (ORT: 0 for a first, right-padded
     // prompt, total - S otherwise), and the row the first new key is written at.
-    std::shared_ptr<ov::Node> total_b, q_past_b, kv_past_b;
+    std::shared_ptr<ov::Node> total_b, q_past_b, kv_past_b, query_len_b;
     if (batched) {
         // [B, 1, 1] with B taken from the query, so a seqlens_k without one entry per batch fails the Reshape
         // instead of broadcasting one length over every batch (ORT requires batch_size elements).
@@ -197,16 +206,20 @@ ov::OutputVector ov::pass::GroupQueryAttentionDecomposition::decompose(
                              register_new_node(v0::Constant::create(ov::element::i64, ov::Shape{2}, {1, 1}))},
             0);
         total_b = register_new_node<v1::Reshape>(real_seqlens, per_batch, false);
-        q_past_b = register_new_node<v1::Maximum>(register_new_node<v1::Subtract>(total_b, current_seqlen), zero);
-        kv_past_b = independent_kv_len
+        query_len_b =
+            has_query_seqlens ? register_new_node<v1::Reshape>(query_seqlens_i64, per_batch, false) : current_seqlen;
+        q_past_b = register_new_node<v1::Maximum>(register_new_node<v1::Subtract>(total_b, query_len_b), zero);
+        // A padded chunk carries full S-row keys (ORT), so its keys start at the query past as well.
+        kv_past_b = independent_kv_len && !has_query_seqlens
                         ? register_new_node<v1::Maximum>(register_new_node<v1::Subtract>(total_b, kv_seqlen), zero)
                         : q_past_b;
     }
     // A single batch entry uses scalar ([1]) lengths; only built when not batched (the [1] reshape needs batch 1).
-    std::shared_ptr<ov::Node> seqlens_1d, past_seqlen;
+    std::shared_ptr<ov::Node> seqlens_1d, past_seqlen, query_len;
     if (!batched) {
         seqlens_1d = register_new_node<v1::Reshape>(real_seqlens, one, false);
-        past_seqlen = register_new_node<v1::Subtract>(seqlens_1d, current_seqlen);
+        query_len = has_query_seqlens ? register_new_node<v1::Reshape>(query_seqlens_i64, one, false) : current_seqlen;
+        past_seqlen = register_new_node<v1::Subtract>(seqlens_1d, query_len);
     }
     const auto curr_seqlen_scalar = register_new_node<v0::Squeeze>(current_seqlen);
 
@@ -236,14 +249,27 @@ ov::OutputVector ov::pass::GroupQueryAttentionDecomposition::decompose(
                 position_ids = register_new_node<v1::Reshape>(get_input(GQAInputs::POSITION_IDS), rows, false);
             } else {
                 const auto column = register_new_node(v0::Constant::create(ov::element::i64, ov::Shape{2}, {-1, 1}));
+                const auto rows = position_ids;
                 position_ids =
-                    register_new_node<v1::Add>(register_new_node<v1::Reshape>(q_past_b, column, false), position_ids);
+                    register_new_node<v1::Add>(register_new_node<v1::Reshape>(q_past_b, column, false), rows);
+                if (has_query_seqlens) {
+                    // Padded rows (P + s >= total) are capped at the last valid position, a valid rotary-cache row;
+                    // their outputs are unspecified (ORT) and valid rows are unchanged.
+                    position_ids =
+                        register_new_node<v1::Minimum>(position_ids,
+                                                       register_new_node<v1::Reshape>(seqlens_elemi64, column, false));
+                }
             }
         } else if (has_input(GQAInputs::POSITION_IDS)) {
             // Flatten position_ids to 1D so that Gather produces 2D [seqlen, head_size/2] output,
             // ensuring correct 4D shapes after Unsqueeze in rotaryEmbedding.
             const auto neg_one = register_new_node(v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}));
             position_ids = register_new_node<v1::Reshape>(get_input(GQAInputs::POSITION_IDS), neg_one, false);
+        } else if (has_query_seqlens) {
+            // Padded rows (P + s >= total) are capped at the last valid position, a valid rotary-cache row; their
+            // outputs are unspecified (ORT) and valid rows are unchanged.
+            position_ids = register_new_node<v1::Minimum>(register_new_node<v1::Add>(position_ids, past_seqlen),
+                                                          register_new_node<v1::Reshape>(seqlens_elemi64, one, false));
         } else {
             position_ids = register_new_node<v1::Add>(position_ids, past_seqlen);
         }
@@ -458,13 +484,28 @@ ov::OutputVector ov::pass::GroupQueryAttentionDecomposition::decompose(
         qga_output = attention[0];
         if (qk_output != ov::op::internal::GroupQueryAttentionQKOutput::NONE) {
             // ONNX Runtime lays output_qk out over the total_sequence_length input, which a static or shared cache
-            // does not tie to seqlens_k; the per-batch lengths only mask. Extra cache rows are dropped here.
+            // does not tie to seqlens_k; the per-batch lengths only mask. Extra attention columns are dropped by
+            // the Slice; a padded chunk's total_sequence_length can instead exceed the tight attention buffer
+            // (it pre-allocates present-cache headroom), so pad the shortfall with zero filler columns to match.
             const auto three = register_new_node(v0::Constant::create(ov::element::i64, ov::Shape{1}, {3}));
             const auto total_cols = register_new_node<v1::Reshape>(
                 register_new_node<v0::Convert>(get_input(GQAInputs::TOTAL_SEQUENCE_LENGTH), ov::element::i64),
                 one,
                 false);
             qk_scores = register_new_node<v8::Slice>(attention[1], zero, total_cols, one, three);
+            if (node->has_padded_query()) {
+                const auto attention_shape = register_new_node<v3::ShapeOf>(attention[1]);
+                const auto attention_cols = get_dimensions(attention_shape, {3});
+                const auto extra =
+                    register_new_node<v1::Maximum>(register_new_node<v1::Subtract>(total_cols, attention_cols), zero);
+                const auto filler_shape =
+                    register_new_node<v0::Concat>(ov::OutputVector{get_dimensions(attention_shape, {0, 1, 2}), extra},
+                                                  0);
+                const auto filler = register_new_node<v3::Broadcast>(
+                    register_new_node(v0::Constant::create(attention[1].get_element_type(), ov::Shape{}, {0})),
+                    filler_shape);
+                qk_scores = register_new_node<v0::Concat>(ov::OutputVector{qk_scores, filler}, 3)->output(0);
+            }
         }
     } else if (sink.get_node_shared_ptr()) {
         // SDPA's 6-input form requires an explicit scale.
@@ -487,6 +528,28 @@ ov::OutputVector ov::pass::GroupQueryAttentionDecomposition::decompose(
         return {output, present_k, present_v, qk_scores};
     }
     return {output, present_k, present_v};
+}
+
+ov::Output<ov::Node> ov::pass::GroupQueryAttentionDecomposition::resize_kv_to_capacity(
+    const ov::Output<ov::Node>& past_rows,
+    const ov::Output<ov::Node>& buffer,
+    const ov::Output<ov::Node>& total_sequence_length) {
+    const auto zero = register_new_node(v0::Constant::create(ov::element::i64, ov::Shape{1}, {0}));
+    const auto one = register_new_node(v0::Constant::create(ov::element::i64, ov::Shape{1}, {1}));
+    const auto two = register_new_node(v0::Constant::create(ov::element::i64, ov::Shape{1}, {2}));
+    const auto buffer_shape = register_new_node<v3::ShapeOf>(buffer);
+    const auto buffer_rows = get_dimensions(buffer_shape, {2});
+    const auto capacity = register_new_node<v1::Maximum>(past_rows, total_sequence_length);
+    const auto trimmed =
+        register_new_node<v8::Slice>(buffer, zero, register_new_node<v1::Minimum>(capacity, buffer_rows), one, two);
+    const auto extra = register_new_node<v1::Maximum>(register_new_node<v1::Subtract>(capacity, buffer_rows), zero);
+    const auto filler_shape = register_new_node<v0::Concat>(
+        ov::OutputVector{get_dimensions(buffer_shape, {0, 1}), extra, get_dimensions(buffer_shape, {3})},
+        0);
+    const auto filler = register_new_node<v3::Broadcast>(
+        register_new_node(v0::Constant::create(buffer.get_element_type(), ov::Shape{}, {0})),
+        filler_shape);
+    return register_new_node<v0::Concat>(ov::OutputVector{trimmed, filler}, 2)->output(0);
 }
 
 ov::pass::GroupQueryAttentionDecomposition::KVCacheOutputs
@@ -584,7 +647,12 @@ ov::pass::GroupQueryAttentionDecomposition::construct_kvcache(
             const auto temp_v = register_new_node<v0::Concat>(ov::OutputVector{resident_v, value}, 2);
 
             // tail = last end_after rows of the temp buffer, scattered into [0, end_after) of the C buffer.
-            const auto temp_len = register_new_node<v1::Add>(end_before, current_seqlen_scalar);
+            // A right-padded chunk (query_seqlens) has only Q = total - past valid rows: its padded tail stays
+            // in the temp buffer (masked for the valid queries) but is never written back.
+            const ov::Output<ov::Node> new_rows =
+                node->has_padded_query() ? register_new_node<v1::Subtract>(abs_total_scalar, abs_past_scalar)->output(0)
+                                         : current_seqlen_scalar;
+            const auto temp_len = register_new_node<v1::Add>(end_before, new_rows);
             const auto tail_start = register_new_node<v1::Subtract>(temp_len, end_after);
             const auto tail_start_1d = register_new_node<v0::Unsqueeze>(tail_start, zero);
             const auto temp_len_1d = register_new_node<v0::Unsqueeze>(temp_len, zero);
@@ -623,15 +691,38 @@ ov::pass::GroupQueryAttentionDecomposition::construct_kvcache(
         auto construct_kv_cache = [&](const ov::Output<ov::Node>& past, const ov::Output<ov::Node>& current) {
             return register_new_node<v0::Concat>(ov::OutputVector{past, current}, 2);
         };
-        const ov::Output<ov::Node> kept_past = independent_kv_len
+        // A padded chunk (query_seqlens) carries full S-row keys starting at the query past.
+        const ov::Output<ov::Node> kept_past = independent_kv_len && !node->has_padded_query()
                                                    ? register_new_node<v1::Subtract>(seqlens_1d, kv_seqlen)->output(0)
                                                    : past_seqlen->output(0);
         const auto sliced_past_key = register_new_node<v8::Slice>(past_key, zero, kept_past, one, two);
         const auto sliced_past_value = register_new_node<v8::Slice>(past_value, zero, kept_past, one, two);
-        outputs.present_key = construct_kv_cache(sliced_past_key, key);
-        outputs.present_value = construct_kv_cache(sliced_past_value, value);
-        outputs.sdpa_key = outputs.present_key;
-        outputs.sdpa_value = outputs.present_value;
+        outputs.sdpa_key = construct_kv_cache(sliced_past_key, key);
+        outputs.sdpa_value = construct_kv_cache(sliced_past_value, value);
+        const auto total_seqlen_pos = static_cast<size_t>(GQAInputs::TOTAL_SEQUENCE_LENGTH);
+        const bool has_total_sequence_length = total_seqlen_pos < node->get_input_size() &&
+                                               !ov::util::is_empty_constant_tensor(node->input_value(total_seqlen_pos));
+        if (node->has_padded_query() && has_total_sequence_length) {
+            // sdpa_key/value already hold the chunk correctly placed at [kept_past, kept_past + rows(current)),
+            // with no overlap to fix up (sliced_past_key/value are trimmed to exactly kept_past). present only
+            // needs resizing to ORT's max(past_rows, total_sequence_length) capacity, independent of that write
+            // window (total_sequence_length is optional -- required only for qk_output -- so present stays
+            // sdpa-sized when it's absent).
+            const auto total_sequence_length = register_new_node<v1::Reshape>(
+                register_new_node<v0::Convert>(node->input_value(total_seqlen_pos), ov::element::i64),
+                one,
+                false);
+            outputs.present_key = resize_kv_to_capacity(get_dimensions(register_new_node<v3::ShapeOf>(past_key), {2}),
+                                                        outputs.sdpa_key,
+                                                        total_sequence_length);
+            outputs.present_value =
+                resize_kv_to_capacity(get_dimensions(register_new_node<v3::ShapeOf>(past_value), {2}),
+                                      outputs.sdpa_value,
+                                      total_sequence_length);
+        } else {
+            outputs.present_key = outputs.sdpa_key;
+            outputs.present_value = outputs.sdpa_value;
+        }
     }
     return outputs;
 }
@@ -648,6 +739,7 @@ ov::pass::GroupQueryAttentionDecomposition::construct_batched_kvcache(
     [[maybe_unused]] KVCacheMetadata& metadata) {
     const auto zero = register_new_node(v0::Constant::create(ov::element::i64, ov::Shape{1}, {0}));
     const auto zero_without_shape = register_new_node(v0::Constant::create(ov::element::i64, ov::Shape{}, {0}));
+    const auto one = register_new_node(v0::Constant::create(ov::element::i64, ov::Shape{1}, {1}));
     const auto one_without_shape = register_new_node(v0::Constant::create(ov::element::i64, ov::Shape{}, {1}));
     const auto kv_num_heads = node->get_kv_num_heads();
     const auto is_static_input = node->has_fixed_kv_capacity();
@@ -686,6 +778,21 @@ ov::pass::GroupQueryAttentionDecomposition::construct_batched_kvcache(
                                                                     ov::element::i64),
                                        as_shape({1, 1, -1, 1}),
                                        false));  // [B, 1, S_kv, 1]
+    // ORT's growing-cache present capacity is max(past_rows, total_sequence_length) (CheckInputs in
+    // onnxruntime/contrib_ops/cpu/bert/group_query_attention_helper.h), a caller-declared value independent of
+    // this step's write. Only a padded chunk can disagree with the plain past+kv_rows append below -- an ordinary
+    // step's total_sequence_length always equals past_rows + kv_rows by ORT's own validation.
+    const auto total_seqlen_pos = static_cast<size_t>(GQAInputs::TOTAL_SEQUENCE_LENGTH);
+    const bool has_total_sequence_length = node->has_padded_query() && total_seqlen_pos < node->get_input_size() &&
+                                           !ov::util::is_empty_constant_tensor(node->input_value(total_seqlen_pos));
+    const ov::Output<ov::Node> total_sequence_length =
+        has_total_sequence_length
+            ? register_new_node<v1::Reshape>(
+                  register_new_node<v0::Convert>(node->input_value(total_seqlen_pos), ov::element::i64),
+                  one,
+                  false)
+                  ->output(0)
+            : ov::Output<ov::Node>();
     const auto write = [&](const ov::Output<ov::Node>& past, const ov::Output<ov::Node>& current) {
         const ov::Output<ov::Node> buffer =
             is_static_input ? past : register_new_node<v0::Concat>(ov::OutputVector{past, current}, 2)->output(0);
@@ -706,8 +813,18 @@ ov::pass::GroupQueryAttentionDecomposition::construct_batched_kvcache(
     };
     outputs.sdpa_key = write(past_key, key);
     outputs.sdpa_value = write(past_value, value);
-    outputs.present_key = outputs.sdpa_key;
-    outputs.present_value = outputs.sdpa_value;
+    // Attention stays on the tight scatter-corrected buffer above; present is separately resized to capacity.
+    if (!is_static_input && has_total_sequence_length) {
+        outputs.present_key = resize_kv_to_capacity(get_dimensions(register_new_node<v3::ShapeOf>(past_key), {2}),
+                                                    outputs.sdpa_key,
+                                                    total_sequence_length);
+        outputs.present_value = resize_kv_to_capacity(get_dimensions(register_new_node<v3::ShapeOf>(past_value), {2}),
+                                                      outputs.sdpa_value,
+                                                      total_sequence_length);
+    } else {
+        outputs.present_key = outputs.sdpa_key;
+        outputs.present_value = outputs.sdpa_value;
+    }
     return outputs;
 }
 

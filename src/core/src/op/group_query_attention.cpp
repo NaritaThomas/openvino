@@ -137,6 +137,8 @@ void GroupQueryAttention::validate_and_infer_types() {
             return "q_norm_weight";
         case GroupQueryAttentionInputs::K_NORM_WEIGHT:
             return "k_norm_weight";
+        case GroupQueryAttentionInputs::QUERY_SEQLENS:
+            return "query_seqlens";
         }
         return "unknown";
     };
@@ -297,6 +299,52 @@ void GroupQueryAttention::validate_and_infer_types() {
                               ".");
     }
 
+    // query_seqlens (ONNX input 16) marks the valid rows of a right-padded chunk appended to an existing cache, so it
+    // needs the past, causal attention and new keys (ORT rejects shared KV), and one length per batch entry. ORT
+    // allows a padded chunk (sequence_length > 1) only for batch_size == 1; a single-token step ignores the input.
+    check_input(GroupQueryAttentionInputs::QUERY_SEQLENS, {1}, integral_types, false);
+    if (has_query_seqlens()) {
+        const auto has_input = [&](GroupQueryAttentionInputs input) {
+            const auto pos = static_cast<size_t>(input);
+            return pos < get_input_size() && !ov::util::is_empty_constant_tensor(input_value(pos));
+        };
+        NODE_VALIDATION_CHECK(this,
+                              has_input(GroupQueryAttentionInputs::PAST_KEY) &&
+                                  has_input(GroupQueryAttentionInputs::PAST_VALUE),
+                              "GroupQueryAttention: query_seqlens requires past_key and past_value.");
+        NODE_VALIDATION_CHECK(this, m_causal, "GroupQueryAttention: query_seqlens requires causal=1.");
+        NODE_VALIDATION_CHECK(this,
+                              !is_shared_kv(),
+                              "GroupQueryAttention: query_seqlens is not supported with shared KV.");
+        const auto& qsl_ps = get_input_partial_shape(static_cast<size_t>(GroupQueryAttentionInputs::QUERY_SEQLENS));
+        NODE_VALIDATION_CHECK(this,
+                              qsl_ps.rank().is_dynamic() || qsl_ps[0].compatible(batch_size),
+                              "GroupQueryAttention: query_seqlens must have batch_size (",
+                              batch_size,
+                              ") elements, got shape ",
+                              qsl_ps,
+                              ".");
+        NODE_VALIDATION_CHECK(this,
+                              batch_size.is_dynamic() || batch_size.get_length() == 1 || sequence_len.is_dynamic() ||
+                                  sequence_len.get_length() == 1,
+                              "GroupQueryAttention: query_seqlens with sequence_length > 1 requires batch_size == 1, "
+                              "got query shape ",
+                              q_shape,
+                              ".");
+        // ORT's CheckQuerySeqlens requires the new key/value chunk to have the same row count as the query (the
+        // padded chunk writes all S rows); a mismatched static key length would apply the query's S rotary/mask
+        // positions to a differently-sized key chunk in the decomposition instead of being rejected here.
+        const auto& key_ps_for_qsl = get_input_partial_shape(static_cast<size_t>(GroupQueryAttentionInputs::KEY));
+        NODE_VALIDATION_CHECK(this,
+                              key_ps_for_qsl.rank().is_dynamic() || key_ps_for_qsl[2].compatible(sequence_len),
+                              "GroupQueryAttention: query_seqlens requires key/value sequence_length to equal "
+                              "query's, got key shape ",
+                              key_ps_for_qsl,
+                              " and query sequence_length ",
+                              sequence_len,
+                              ".");
+    }
+
     if (m_do_rotary) {
         // Partial RoPE (GPT-NeoX/Phi-style): rotary_dim = 2 * cos_cache.shape[-1] may be smaller than
         // head_size; only the leading rotary_dim channels are rotated (see
@@ -415,7 +463,28 @@ void GroupQueryAttention::validate_and_infer_types() {
     const auto& key_ps = get_input_partial_shape(static_cast<size_t>(GroupQueryAttentionInputs::KEY));
     const bool dynamic_kv_len = key_ps.rank().is_static() && key_ps[2].is_dynamic();
     if (!m_sliding_window_cache && !is_shared_kv() && !has_fixed_kv_capacity()) {
-        output_kv_len += dynamic_kv_len ? key_ps[2] : sequence_len;
+        if (has_padded_query()) {
+            // present capacity is max(past_rows, total_sequence_length) for a padded chunk (CheckInputs in
+            // onnxruntime/contrib_ops/cpu/bert/group_query_attention_helper.h), including an empty (0-row) past --
+            // total_sequence_length can pre-allocate headroom beyond the current chunk either way, so
+            // past_rows + sequence_len no longer bounds it. A windowed cache keeps the plain past_rows rule above
+            // instead (ORT never grows it to total_sequence_length). Fold a constant total_sequence_length for a
+            // tight static bound; it's optional (required only for qk_output), so an absent input is an empty
+            // Constant.
+            const auto total_len_input =
+                input_value(static_cast<size_t>(GroupQueryAttentionInputs::TOTAL_SEQUENCE_LENGTH));
+            const auto total_len_const = ov::util::is_empty_constant_tensor(total_len_input)
+                                             ? nullptr
+                                             : ov::util::get_constant_from_source(total_len_input);
+            if (total_len_const && output_kv_len.is_static()) {
+                output_kv_len =
+                    Dimension(std::max(output_kv_len.get_length(), total_len_const->cast_vector<int64_t>().at(0)));
+            } else {
+                output_kv_len = Dimension::dynamic();
+            }
+        } else {
+            output_kv_len += dynamic_kv_len ? key_ps[2] : sequence_len;
+        }
     }
 
     set_output_type(0, q_type, PartialShape{batch_size, sequence_len, head_size * m_num_heads});
@@ -457,6 +526,18 @@ bool GroupQueryAttention::has_fixed_kv_capacity() const {
 bool GroupQueryAttention::has_qk_norm() const {
     const auto pos = static_cast<size_t>(GroupQueryAttentionInputs::Q_NORM_WEIGHT);
     return pos < get_input_size() && !ov::util::is_empty_constant_tensor(input_value(pos));
+}
+
+bool GroupQueryAttention::has_query_seqlens() const {
+    const auto pos = static_cast<size_t>(GroupQueryAttentionInputs::QUERY_SEQLENS);
+    return pos < get_input_size() && !ov::util::is_empty_constant_tensor(input_value(pos));
+}
+
+bool GroupQueryAttention::has_padded_query() const {
+    const auto& q_ps = get_input_partial_shape(static_cast<size_t>(GroupQueryAttentionInputs::QUERY));
+    const bool single_token =
+        q_ps.rank().is_static() && q_ps.rank().get_length() == 4 && q_ps[2].is_static() && q_ps[2].get_length() == 1;
+    return has_query_seqlens() && !single_token;
 }
 
 bool GroupQueryAttention::visit_attributes(AttributeVisitor& visitor) {
